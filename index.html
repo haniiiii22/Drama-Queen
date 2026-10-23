@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!--CSP-->
+    <meta name="referrer" content="no-referrer" />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="theme-color" content="#0b1613" />
+    <meta name="description" content="Drama Queen is a personal, non-commercial movie and TV series archive." />
+    <title>Drama Queen</title>
+    <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
+    <!-- Sets the theme before first paint so the wrong theme never flashes. Its SHA-256 is added to the CSP at build time. -->
+    <script>
+      (function () {
+        var t;
+        try { t = localStorage.getItem('dq-theme'); } catch (e) {}
+        if (t !== 'light' && t !== 'dark') {
+          t = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+        }
+        document.documentElement.setAttribute('data-theme', t);
+        var m = document.querySelector('meta[name="theme-color"]');
+        if (m) m.setAttribute('content', t === 'light' ? '#EEE7E3' : '#0b1613');
+      })();
+    </script>
+    <script type="module" src="./src/main.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main" id="skip-link">Skip to content</a>
+
+    <div id="app-shell">
+      <header class="site-header">
+        <div class="header-inner">
+          <a class="brand" href="#/" aria-label="Drama Queen, home">
+            <span class="brand-logo" id="brand-logo" hidden></span>
+            <span class="brand-name">Drama Queen</span>
+          </a>
+
+          <nav class="nav" id="site-nav" aria-label="Main">
+            <a href="#/" data-route="home">Home</a>
+            <a href="#/movies" data-route="movies">Movies</a>
+            <a href="#/series" data-route="series">Series</a>
+            <a href="#/about" data-route="about">About</a>
+          </nav>
+
+          <div class="header-tools">
+            <form class="search" id="search-form" role="search" autocomplete="off">
+              <span class="search-icon" id="search-icon"></span>
+              <label class="sr-only" for="search-input">Search titles</label>
+              <input id="search-input" type="search" name="q" placeholder="Search titles" maxlength="100" enterkeyhint="search" spellcheck="false" />
+              <button type="button" class="search-clear" id="search-clear" aria-label="Clear search" hidden></button>
+            </form>
+            <div class="tool-buttons">
+              <button type="button" class="icon-btn" id="theme-toggle"></button>
+              <button type="button" class="icon-btn menu-btn" id="menu-btn" aria-expanded="false" aria-controls="site-nav" aria-label="Open menu"></button>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <main id="main" tabindex="-1"></main>
+    </div>
+
+    <noscript>
+      <p class="noscript">Drama Queen needs JavaScript to load your collection.</p>
+    </noscript>
+  </body>
+</html>
