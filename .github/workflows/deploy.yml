@@ -1,0 +1,233 @@
+name: Update catalog and deploy
+
+# Architecture:  public/Movies.txt → [plan] → [fetch: OMDb/TMDB, the ONLY job with API secrets]
+#                → [persist: commit catalog] → [build] → [deploy: GitHub Pages]
+# The website itself never calls OMDb or TMDB; it only reads public/data/catalog.json.
+# See README.md ("How it works") and SECURITY.md.
+
+on:
+  push:
+    branches: [main] # must be the repository's default branch (the jobs below also check this)
+  pull_request: # build + test only: never receives secrets, never deploys
+  workflow_dispatch:
+    inputs:
+      force_refresh:
+        description: "Re-check every title, ignoring freshness windows (still honours the request budget)"
+        type: boolean
+        default: false
+      allow_large_removal:
+        description: "Allow Movies.txt to remove most of the catalog (guard against a truncated file)"
+        type: boolean
+        default: false
+  # Optional scheduled refresh (disabled by default). Uncomment to enable; with a fresh catalog
+  # a scheduled run makes zero metadata requests.
+  # schedule:
+  #   - cron: "17 4 * * 1"
+
+# Least privilege: nothing by default; every job declares exactly what it needs.
+permissions: {}
+
+# One catalog update / deployment at a time. Runs queue instead of being cancelled midway,
+# so a catalog commit or Pages deployment is never interrupted.
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || 'catalog-and-deploy' }}
+  cancel-in-progress: false
+
+jobs:
+  # ------------------------------------------------------------------ tests (no secrets)
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - name: Dependency audit (advisory)
+        run: npm audit
+        continue-on-error: true
+
+  # ------------------------------------------------------------------ plan (no secrets, no network)
+  # Decides, offline, whether any metadata work is needed. Unrelated code changes therefore
+  # never trigger API requests: with an up-to-date catalog this job answers "false".
+  plan:
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      needs_fetch: ${{ steps.decide.outputs.needs_fetch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - id: plan
+        run: node scripts/refresh-catalog.mjs --plan
+        env:
+          FORCE_REFRESH: ${{ github.event_name == 'workflow_dispatch' && inputs.force_refresh == true && 'true' || 'false' }}
+          ALLOW_LARGE_REMOVAL: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_large_removal == true && 'true' || 'false' }}
+      - id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          PLAN: ${{ steps.plan.outputs.needs_fetch }}
+        run: |
+          # Manual and scheduled runs always run the fetch job; it makes zero requests if nothing is due.
+          if [ "$EVENT" = "workflow_dispatch" ] || [ "$EVENT" = "schedule" ] || [ "$PLAN" = "true" ]; then
+            echo "needs_fetch=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_fetch=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ------------------------------------------------------------------ fetch (THE ONLY JOB WITH API SECRETS)
+  # Runs only on trusted events on the default branch, from the repository's own code. It uses
+  # Node built-ins only (no `npm install`), so no third-party code ever runs next to the secrets.
+  # It has read-only repository access and hands its result on as a short-lived artifact.
+  fetch:
+    needs: [test, plan]
+    if: needs.plan.outputs.needs_fetch == 'true' && github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: Fetch metadata and generate the catalog
+        run: node scripts/refresh-catalog.mjs --out catalog-out
+        env:
+          # Secrets exist only in this step's environment: never in arguments, files or logs.
+          OMDB_API_KEY: ${{ secrets.OMDB_API_KEY }}
+          TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+          # Non-secret controls.
+          FORCE_REFRESH: ${{ github.event_name == 'workflow_dispatch' && inputs.force_refresh == true && 'true' || 'false' }}
+          ALLOW_LARGE_REMOVAL: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_large_removal == true && 'true' || 'false' }}
+          CATALOG_TTL_DAYS: ${{ vars.CATALOG_TTL_DAYS }}
+          CATALOG_NEGATIVE_TTL_DAYS: ${{ vars.CATALOG_NEGATIVE_TTL_DAYS }}
+          CATALOG_BACKDROP_TTL_DAYS: ${{ vars.CATALOG_BACKDROP_TTL_DAYS }}
+          CATALOG_BACKDROP_NEGATIVE_TTL_DAYS: ${{ vars.CATALOG_BACKDROP_NEGATIVE_TTL_DAYS }}
+          CATALOG_MAX_OMDB_REQUESTS: ${{ vars.CATALOG_MAX_OMDB_REQUESTS }}
+          CATALOG_MAX_TMDB_REQUESTS: ${{ vars.CATALOG_MAX_TMDB_REQUESTS }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: catalog
+          path: |
+            catalog-out/catalog.json
+            catalog-out/report.json
+          if-no-files-found: error
+          retention-days: 1
+
+  # ------------------------------------------------------------------ persist (no API secrets; the only job that can write)
+  persist:
+    needs: fetch
+    if: needs.fetch.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.final.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: catalog
+          path: catalog-in
+      - name: Revalidate and install the catalog
+        id: install
+        # Re-validates from scratch and refuses stale results (the catalog or Movies.txt changed meanwhile).
+        run: node scripts/persist-catalog.mjs --artifact catalog-in
+      - name: Commit the catalog (only if it changed)
+        if: steps.install.outputs.changed == 'true'
+        env:
+          BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add public/data/catalog.json
+          git commit -m "chore(catalog): update metadata catalog [skip ci]"
+          for attempt in 1 2 3; do
+            if git push origin "HEAD:refs/heads/${BRANCH}"; then exit 0; fi
+            git fetch origin "${BRANCH}"
+            # Unrelated files may have changed; the catalog or title list must not have.
+            if ! git diff --quiet HEAD~1 "origin/${BRANCH}" -- public/data/catalog.json public/Movies.txt; then
+              echo "::error::The catalog or Movies.txt changed upstream while this run was working. Not overwriting; re-run the workflow."
+              exit 1
+            fi
+            git rebase "origin/${BRANCH}"
+          done
+          echo "::error::Could not push the catalog commit."
+          exit 1
+      - id: final
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  # ------------------------------------------------------------------ build (no secrets)
+  # A bot commit made with GITHUB_TOKEN does not trigger another workflow run, so this run
+  # builds and deploys the freshly persisted commit itself.
+  build:
+    needs: [test, plan, fetch, persist]
+    if: ${{ !cancelled() && needs.test.result == 'success' && (needs.plan.result == 'success' || needs.plan.result == 'skipped') && (needs.fetch.result == 'success' || needs.fetch.result == 'skipped') && (needs.persist.result == 'success' || needs.persist.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.persist.outputs.sha }} # empty (default ref) when nothing was persisted
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Validate the catalog (must match Movies.txt)
+        if: github.event_name != 'pull_request'
+        run: node scripts/validate-catalog.mjs public/data/catalog.json --source public/Movies.txt --require-in-sync
+      - name: Validate the catalog (pull requests, sync is advisory)
+        if: github.event_name == 'pull_request'
+        run: node scripts/validate-catalog.mjs public/data/catalog.json --source public/Movies.txt
+      - name: Build and verify
+        run: npm run build
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        if: github.event_name != 'pull_request'
+        with:
+          path: dist
+
+  # ------------------------------------------------------------------ deploy (Pages permissions only)
+  deploy:
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
